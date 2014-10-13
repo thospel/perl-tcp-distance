@@ -1,0 +1,427 @@
+#!/usr/bin/perl -w
+use strict;
+
+my $VERSION = "1.000";
+
+use Getopt::Long 2.24 qw(:config bundling);
+use Errno qw(EHOSTUNREACH ETIMEDOUT ECONNREFUSED EINTR EINPROGRESS EINVAL);
+use Socket qw(getaddrinfo getnameinfo
+	AF_INET AF_INET6 NI_NUMERICHOST NI_NUMERICSERV SO_ERROR
+	IPPROTO_IP IPPROTO_IPV6 IP_TTL IPV6_UNICAST_HOPS IPPROTO_TCP SOL_SOCKET);
+use Scalar::Util qw(dualvar);
+use POSIX qw(ceil F_GETFL F_SETFL O_NONBLOCK);
+use Time::HiRes qw(time);
+
+my $MAX_TTL = 255;
+
+my $timeout = 5;
+my $quiet   = 0;
+my $debug   = 0;
+my $traceroute = "traceroute";
+my $high    = 64;	# Lowest probe that had the expected result
+my $low     = 1;	# Highest probe that did not have the expected result+1
+
+die "Could not parse your command line. Try $0 -h\n" unless
+    GetOptions("m|max-hops=o"	=> \$high,
+               "w|waittime=f"	=> \$timeout,
+               "T|traceroute=s"	=> \$traceroute,
+               "q|quiet!"	=> \$quiet,
+               "d|debug!"	=> \$debug,
+               "6!"		=> \my $ipv6,
+               "4!"		=> \my $ipv4,
+               "s|source=s"	=> \my $source,
+               "version!"	=> \my $version,
+               "U|unsafe!"	=> \my $unsafe,
+               "h|help!"	=> \my $help);
+
+if ($version) {
+    print<<"EOF";
+trace_tcp (Ton Utils) $VERSION
+EOF
+    exit 0;
+}
+if ($help) {
+    require Config;
+    $ENV{PATH} .= ":" unless $ENV{PATH} eq "";
+    $ENV{PATH} = "$ENV{PATH}$Config::Config{'installscript'}";
+    exec("perldoc", "-F", $unsafe ? "-U" : (), $0) || exit 1;
+    # make parser happy
+    %Config::Config = ();
+}
+
+die "max_hops must be >= 1\n" if $high < 1;
+die "max_hops must be <= $MAX_TTL\n" if $high > $MAX_TTL;
+die "Timeout must be positive\n" if $timeout <= 0;
+die "Cannot force both IPv4 and IPv6\n" if $ipv4 && $ipv6;
+
+my ($host, $service) = @ARGV;
+$host ||= "www.google.com";
+$service ||= 80;
+my ($err, @res) = getaddrinfo($host, $service, {
+    $ipv6 ? (family	=> AF_INET6) :
+    $ipv4 ? (family	=> AF_INET) :
+    (),
+    protocol		=> IPPROTO_TCP,
+});
+if ($err) {
+    my ($err2) = getaddrinfo("0.0.0.0", $service, {
+        family		=> AF_INET,
+        protocol	=> IPPROTO_TCP,
+    });
+    die "Unknown service '$service'\n" if $err2;
+
+    if ($ipv6 || $ipv4) {
+        ($err2) = getaddrinfo($host, $service, {
+            protocol	=> IPPROTO_TCP,
+        });
+        if (!$err2) {
+            die $ipv6 ?
+                "Could not resolve $host using IPv6 (but an IPv4 address exists)\n" :
+                "Could not resolve $host using IPv4 (but an IPv6 address exists)\n";
+        }
+    }
+    die "Could not resolve $host (neither IPv6 nor IPv4)\n";
+}
+my ($from, $source_ip, $to);
+if ($source) {
+    my ($err, @from) = getaddrinfo($source, 0, {
+        $ipv6 ? (family	=> AF_INET6) :
+        $ipv4 ? (family	=> AF_INET) :
+        (),
+        protocol	=> IPPROTO_TCP,
+    });
+    if ($err) {
+        if ($ipv6 || $ipv4) {
+            my ($err2) = getaddrinfo($source, 0, {
+                protocol	=> IPPROTO_TCP,
+            });
+            if (!$err2) {
+                die $ipv6 ?
+                    "Could not resolve $host using IPv6 (but an IPv4 address exists)\n" :
+                    "Could not resolve $host using IPv4 (but an IPv6 address exists)\n";
+            }
+        }
+        die "Could not resolve $source (neither IPv6 nor IPv4)\n";
+    }
+
+    # Look for a compatibe source and destination
+    my %family_seen;
+    for my $res (@res) {
+        next if $family_seen{$res->{family}};
+        $family_seen{$res->{family}} = 1;
+        for my $f (@from) {
+            if ($f->{family} == $res->{family}) {
+                $to   = $res;
+                $from = $f;
+            }
+        }
+    }
+    die "Could resolve $host and $source but their address families are incompatible\n" if !$to;
+
+    ($err, $source_ip) =
+        getnameinfo($from->{addr}, NI_NUMERICHOST | NI_NUMERICSERV);
+    die "Assertion: Could not understand result for $source: $err\n" if $err;
+} else {
+    $to = $res[0];
+}
+$to || die "Assertion: No address structure from getaddrinfo";
+
+($err, my $ip, my $port) =
+    getnameinfo($to->{addr}, NI_NUMERICHOST | NI_NUMERICSERV);
+die "Assertion: Could not understand result for $host $service: $err\n" if $err;
+print "Using ip $ip port $port\n",  if
+    !$quiet && ($ip ne $host || $port ne $service);
+
+
+sub blocking(*;$) {
+    my $handle = shift;
+    no warnings;
+    if ($^O eq 'MSWin32' || $^O eq 'VMS') {
+	# There seems to be no way to query the state
+	return undef unless @_;
+
+	# FIONBIO enables non-blocking sockets on windows and vms.
+	# FIONBIO is (0x80000000|(4<<16)|(ord('f')<<8)|126),
+	# as per winsock.h, ioctl.h
+	my $fionbio = 0x8004667e;
+	my $val = pack("L!", shift() ? 0 : 1);
+	ioctl($handle, $fionbio, $val) || die "Can't set ioctl flags: $!";
+    } else {
+	my $flags = fcntl($handle, F_GETFL, 0) ||
+	    die "Can't get fcntl flags: $!\n";
+	return $flags & O_NONBLOCK() ? 0 : 1 unless @_;
+	fcntl($handle, F_SETFL,
+	      shift() ?
+	      $flags & O_NONBLOCK() ? $flags & ~O_NONBLOCK : return :
+	      $flags & O_NONBLOCK() ? return : $flags | O_NONBLOCK) or
+	      die "Can't set fcntl flags: $!";
+    }
+}
+
+sub ttl_probe {
+    my ($ttl) = @_;
+
+    socket(my $s, $to->{family}, $to->{socktype}, $to->{protocol}) ||
+        die "Could not open socket: $!";
+    bind($s, $from->{addr}) || die "Could not bind socket: $!" if $from;
+    blocking($s, 0);
+
+    if ($to->{family} == AF_INET) {
+        # Should really use SOL_IP, but IPPROTO_IP is more common and the same
+        setsockopt($s, IPPROTO_IP, IP_TTL, $ttl) ||
+            die "Could not setsockopt: $!";
+    } elsif ($to->{family} == AF_INET6) {
+        setsockopt($s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, $ttl) ||
+            die "Could not setsockopt: $!";
+    } else {
+        die "Assertion: Unknown family '$to->{family}'";
+    }
+
+    my $err;
+    my $time = time();
+    if (connect($s, $to->{addr})) {
+        $time = time() - $time;
+        $err = dualvar(0, "connection");
+    } elsif ($! == EINPROGRESS) {
+        my $win = "";
+        vec($win, fileno($s), 1) = 1;
+        my $cur_time = $time;
+        my $end_time = $cur_time + $timeout;
+        while (1) {
+            my $time_left = $end_time - $cur_time;
+            if ($time_left <= 0) {
+                # Handle as timeout
+                $time = time() - $time;
+                $err = $! = ETIMEDOUT;
+                last;
+            }
+            my $rc = select(undef, my $w = $win, undef, $time_left);
+            if ($rc == 1) {
+                # Connect result
+                $time = time() - $time;
+                my $packed = getsockopt($s, SOL_SOCKET, SO_ERROR) ||
+                    die "Could not getsockopt: $!";
+                $! = unpack("I", $packed);
+                $err = $! || dualvar(0, "connection");
+                last;
+            } elsif ($rc == 0) {
+                # Timeout
+                $time = time() - $time;
+                $err = $! = ETIMEDOUT;
+                last;
+            } elsif ($rc == -1) {
+                # Select error
+                $! == EINTR || die "Could not select(): $!";
+            }
+        } continue {
+            $cur_time = time();
+        }
+    } elsif ($! == EINVAL) {
+        # EINVAL on connect is not documented properly.
+        # Some ways you can get it:
+        # - bind and connect addresses cannot possibly match (this case)
+        #       e.g. connection to the internet from 127.0.0.1
+        #       (but e.g. connecting from ::1 does not give EINVAL
+        #        (but the connect still fails))
+        die "$host cannot be reached from '$source'\n" if $source;
+        # - do a new connect on the same socket after a previous connect
+        #   (BSD)
+        # - An invalid argument was detected (e.g., address_len is not valid
+        #   for the address family, the specified address family is invalid)
+        die "connect to $ip $port failed: $!\n";
+    } else {
+        # Immediate error
+        $time = time() - $time;
+        $err = $!;
+    }
+    printf STDERR "TTL %2d: %s after %.0f ms\n", $ttl, $err, $time*1000 if $debug;
+    return $err;
+}
+
+sub traceroute {
+    my ($ttl) = @_;
+
+    # Flush current output
+    $| = 1;
+    print "";
+
+    %ENV = ();
+    $ENV{PATH} = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
+    my $ec = system($traceroute,
+                    "-f" => $ttl,
+                    "-m" => $ttl,
+                    "-w" =>  $timeout,
+                    $source_ip ? ("-s" => $source_ip) : (),
+                    $ip);
+    die "Unexpected exit code $ec from '$traceroute'\n" if $ec;
+}
+
+my $final = ttl_probe($high);
+if ($final == EHOSTUNREACH) {
+    print "Failed to connect to $host $service at TTL $high: $!\n";
+    print "This means I'm unable to probe smaller TTLs. Aborting\n";
+    exit 254;
+}
+
+while ($high != $low) {
+    my $ttl = ceil(sqrt($low * ($high-1)));
+    my $err = ttl_probe($ttl);
+    if ($err == $final) {
+        $high = $ttl;
+    } elsif ($err == 0) {
+        print "Unexpected connect to $host $service at TTL $ttl though we failed at TTL $high. Recovering\n" if !$quiet;
+        $high = $ttl;
+        $final = $err;
+    } else {
+        print "Failed to connect to $host $service at TTL $ttl: $err. Forging on in search of $final\n" if !$quiet && $err != EHOSTUNREACH;
+        $low = $ttl+1;
+    }
+}
+if ($final == 0) {
+    print "Connected to $host $service at TTL $high\n";
+} else {
+    print "Failed to connect to $host $service at TTL $high: $final\n";
+    traceroute($high) if !$quiet && $final != ECONNREFUSED;
+}
+
+__END__
+
+=head1 NAME
+
+trace_tcp - Find the hop distance at which a host connect succeeds or fails
+
+=head1 SYNOPSIS
+
+ trace_tcp [-4] [-6] [-s|--source host] [-m|--max_hops max_ttl] [--w|--waittime time] [-q|--quiet] [-d|--debug] [-T|--traceroute [--traceroute-program program]] [host [port]]
+ trace_tcp --version
+ trace_tcp [--unsafe|-U] -h|--help
+
+=head1 DESCRIPTION
+
+B<trace_tcp> tries a connect with various TTLs to determine at which hop count
+the normal result gets established. The main use of this program is to determine
+how far away a host is or how far away a blocking firewall sits. Combining the
+failure case with a normal traceroute might then even get you the exact identity
+of the firewall if anything is returned at that hop count.
+
+Unlike several standard TCP traceroute tools this program does not require any
+special privileges.
+
+host defaults to www.google.com, port defaults to 80
+
+=head1 OPTIONS
+
+=over 4
+
+=item X<ipv6>-6
+
+Force ipv6
+
+=item X<ipv4>-4
+
+Force ipv4
+
+=item X<max_hops>-m, --max-hops integer
+
+Maximum hop distance that will be probed. This is also determines the initial
+probe that gets done to determine the expected result of a connection. Defaults
+to 64.
+
+=item X<source>-s source_addr, --source source_addr
+
+Chooses an alternative source address. Note that you must select the address of
+one of the interfaces. By default, the address of the outgoing interface is
+used.
+
+=item X<waittime>-w float, --waittime float
+
+How long to wait for the result of a connection attempt in seconds. Defaults to
+5.
+
+=item X<traceroute>-T program, --traceroute program
+
+If the connection fails a traceroute is run for the distance on which the
+connection fails. This option decides which  program gets run in that case.
+Defaults to C<traceroute>.
+
+=item X<quiet>-q, --quiet
+
+Be less chatty, just print the final result
+
+=item X<debug>-d, --debug
+
+Give debugging output. Mainly tells you what probes get done and their result.
+
+=item X<help>-h, --help
+
+Show this help.
+
+=item X<unsafe>-U, --unsafe
+
+Allow even root to run the perldoc.
+Remember, the reason this is off by default is because it B<IS> unsafe.
+
+=item X<version>--version
+
+Print version info.
+
+=back
+
+=head1 EXAMPLE
+
+A typical use would be:
+
+  trace_tcp www.google.com 80
+
+with an output like:
+
+  Using ip 2a00:1450:4013:c00::6a port 80
+  Failed to connect to www.google.com 80 at TTL 10: Connection timed out. Forging on in search of connection
+  Connected to www.google.com 80 at TTL 11
+
+This indicates that www.google.com is 11 hops aways. The device at 10 hops is
+probably some form of packet filter (e.g. a firewall). Notice that not all
+distances before the final TTL get probed so the list of filtering devices does
+not have to be exhaustive. However the device just before the final TTL is
+guaranteed to have been probed.
+
+Another use:
+
+  trace_tcp www.google.com 81
+
+with an output like:
+
+  Using ip 2a00:1450:4013:c00::6a port 81
+  Failed to connect to www.google.com 81 at TTL 5: Connection timed out
+  traceroute to 2a00:1450:4013:c00::6a (2a00:1450:4013:c00::6a), 5 hops max, 80 byte packets
+   5  amsix-router.google.com (2001:7f8:1::a501:5169:1)  22.648 ms  22.962 ms  24.739 ms
+
+This indicates that port 81 is probably blocked by core2.ams.net.google.com at
+a distance of 5 hops.
+
+=head1 BUGS
+
+Will not work if a normal connect to the target host returns C<host unreachable>
+since the TTL probes also return that same failure. Therefore the program will
+be unable to see where the behaviour changes. Using raw sockets would enable
+interpreting the exact ICMP packets but that would mean the program has to be
+privileged.
+
+=head1 SEE ALSO
+
+L<traceroute(1)>,
+L<tcptraceroute(1)>
+
+=head1 AUTHOR
+
+Ton Hospel, E<lt>trace_tcp@ton.iguana.beE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2014 by Ton Hospel
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.2 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
