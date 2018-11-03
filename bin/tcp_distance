@@ -36,7 +36,7 @@ die "Could not parse your command line. Try $0 -h\n" unless
 
 if ($version) {
     print<<"EOF";
-trace_tcp (Ton Utils) $VERSION
+tcp_distance (Ton Utils) $VERSION
 EOF
     exit 0;
 }
@@ -247,12 +247,14 @@ sub traceroute {
 
     %ENV = ();
     $ENV{PATH} = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin";
-    my $ec = system($traceroute,
-                    "-f" => $ttl,
-                    "-m" => $ttl,
-                    "-w" =>  $timeout,
-                    $source_ip ? ("-s" => $source_ip) : (),
-                    $ip);
+    my @command = ($traceroute,
+                   "-f" => $ttl,
+                   "-m" => $ttl,
+                   "-w" =>  $timeout,
+                   $source_ip ? ("-s" => $source_ip) : (),
+                   $ip);
+    # print STDERR "@command\n";
+    my $ec = system(@command);
     die "Unexpected exit code $ec from '$traceroute'\n" if $ec;
 }
 
@@ -288,17 +290,17 @@ __END__
 
 =head1 NAME
 
-trace_tcp - Find the hop distance at which a host connect succeeds or fails
+tcp_distance - Find the hop distance at which a host connect succeeds or fails
 
 =head1 SYNOPSIS
 
- trace_tcp [-4] [-6] [-s|--source host] [-m|--max_hops max_ttl] [--w|--waittime time] [-q|--quiet] [-d|--debug] [-T|--traceroute [--traceroute-program program]] [host [port]]
- trace_tcp --version
- trace_tcp [--unsafe|-U] -h|--help
+ tcp_distance [-4] [-6] [-s|--source host] [-m|--max_hops max_ttl] [--w|--waittime time] [-q|--quiet] [-d|--debug] [-T|--traceroute [--traceroute-program program]] [host [port]]
+ tcp_distance --version
+ tcp_distance [--unsafe|-U] -h|--help
 
 =head1 DESCRIPTION
 
-B<trace_tcp> tries a connect with various TTLs to determine at which hop count
+B<tcp_distance> tries a connect with various TTLs to determine at which hop count
 the normal result gets established. The main use of this program is to determine
 how far away a host is or how far away a blocking firewall sits. Combining the
 failure case with a normal traceroute might then even get you the exact identity
@@ -371,7 +373,7 @@ Print version info.
 
 A typical use would be:
 
-  trace_tcp www.google.com 80
+  tcp_distance www.google.com 80
 
 with an output like:
 
@@ -387,7 +389,7 @@ guaranteed to have been probed.
 
 Another use:
 
-  trace_tcp www.google.com 81
+  tcp_distance www.google.com 81
 
 with an output like:
 
@@ -396,7 +398,7 @@ with an output like:
   traceroute to 2a00:1450:4013:c00::6a (2a00:1450:4013:c00::6a), 5 hops max, 80 byte packets
    5  amsix-router.google.com (2001:7f8:1::a501:5169:1)  22.648 ms  22.962 ms  24.739 ms
 
-This indicates that port 81 is probably blocked by core2.ams.net.google.com at
+This indicates that port 81 is probably blocked by I<amsix-router.google.com> at
 a distance of 5 hops.
 
 =head1 BUGS
@@ -414,7 +416,7 @@ L<tcptraceroute(1)>
 
 =head1 AUTHOR
 
-Ton Hospel, E<lt>trace_tcp@ton.iguana.beE<gt>
+Ton Hospel, E<lt>tcp_distance@ton.iguana.beE<gt>
 
 =head1 COPYRIGHT AND LICENSE
 
