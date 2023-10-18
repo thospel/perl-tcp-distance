@@ -1,16 +1,16 @@
 # NAME
 
-trace\_tcp - Find the hop distance at which a host connect succeeds or fails
+tcp\_distance - Find the hop distance at which a host connect succeeds or fails
 
 # SYNOPSIS
 
-    trace_tcp [-4] [-6] [-s|--source host] [-m|--max_hops max_ttl] [--w|--waittime time] [-q|--quiet] [-d|--debug] [-T|--traceroute [--traceroute-program program]] [host [port]]
-    trace_tcp --version
-    trace_tcp [--unsafe|-U] -h|--help
+    tcp_distance [-4] [-6] [-s|--source host] [-m|--max_hops max_ttl] [--w|--waittime time] [-q|--quiet] [-d|--debug] [-T|--traceroute [--traceroute-program program]] [host [port]]
+    tcp_distance --version
+    tcp_distance [--unsafe|-U] -h|--help
 
 # DESCRIPTION
 
-**trace\_tcp** tries a connect with various TTLs to determine at which hop count
+**tcp\_distance** tries a connect with various TTLs to determine at which hop count
 the normal result gets established. The main use of this program is to determine
 how far away a host is or how far away a blocking firewall sits. Combining the
 failure case with a normal traceroute might then even get you the exact identity
@@ -79,7 +79,7 @@ host defaults to www.google.com, port defaults to 80
 
 A typical use would be:
 
-    trace_tcp www.google.com 80
+    tcp_distance www.google.com 80
 
 with an output like:
 
@@ -95,7 +95,7 @@ guaranteed to have been probed.
 
 Another use:
 
-    trace_tcp www.google.com 81
+    tcp_distance www.google.com 81
 
 with an output like:
 
@@ -122,7 +122,7 @@ privileged.
 
 # AUTHOR
 
-Ton Hospel, &lt;trace\_tcp@ton.iguana.be>
+Ton Hospel, &lt;tcp\_distance@ton.iguana.be>
 
 # COPYRIGHT AND LICENSE
 
